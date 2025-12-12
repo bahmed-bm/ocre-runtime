@@ -8,9 +8,9 @@
 #ifndef OCRE_H
 #define OCRE_H
 
-#include <zephyr/logging/log.h>
+#include "ocre_core_external.h"
 
-#if CONFIG_OCRE_LOG_DEBUG
+#ifdef CONFIG_OCRE_LOG_DEBUG
 #define OCRE_LOG_LEVEL LOG_LEVEL_DBG
 #elif CONFIG_OCRE_LOG_ERR
 #define OCRE_LOG_LEVEL LOG_LEVEL_ERR

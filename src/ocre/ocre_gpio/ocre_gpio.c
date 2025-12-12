@@ -1,598 +1,728 @@
 /**
  * @copyright Copyright © contributors to Project Ocre,
- * which has been established as Project Ocre a Series of LF Projects, LLC
+ * which has been established as Project Ocre, a Series of LF Projects, LLC
  *
  * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <ocre/ocre.h>
+#include <ocre/api/ocre_common.h>
+#include <ocre/ocre_gpio/ocre_gpio.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/kernel.h>
-#include "ocre_gpio.h"
-#include "wasm_export.h"
-#include <stdlib.h>
-#include <stdbool.h>
-#include <errno.h>
+#include <zephyr/spinlock.h>
 
 LOG_MODULE_DECLARE(ocre_cs_component, OCRE_LOG_LEVEL);
 
-#define GPIO_STACK_SIZE      2048
-#define GPIO_THREAD_PRIORITY 5
-#define WASM_STACK_SIZE      (8 * 1024)
-
 typedef struct {
-    bool in_use;
-    uint32_t id;
-    const struct device *port;
-    gpio_pin_t pin_number;
-    ocre_gpio_direction_t direction;
-    struct gpio_callback gpio_cb_data;
-    ocre_gpio_callback_t user_callback;
+	uint32_t in_use : 1;
+	uint32_t direction : 1;
+	uint32_t pin_number : 6;
+	uint32_t port_idx : 4;
+	struct gpio_callback *cb;
+	wasm_module_inst_t owner;
 } gpio_pin_ocre;
 
-static K_THREAD_STACK_DEFINE(gpio_thread_stack, GPIO_STACK_SIZE);
-static struct k_thread gpio_thread;
-static k_tid_t gpio_thread_id;
+typedef struct {
+	const char *name;
+	const struct device *port;
+	gpio_pin_t pin;
+	int port_idx;
+} gpio_alias_t;
+static gpio_alias_t gpio_aliases[CONFIG_OCRE_GPIO_MAX_PINS];
+static int gpio_alias_count = 0;
 
-K_MSGQ_DEFINE(gpio_msgq, sizeof(uint32_t) * 2, 10, 4);
-
-// GPIO pin management
-static gpio_pin_ocre gpio_pins[CONFIG_OCRE_GPIO_MAX_PINS] = {0};
-static wasm_function_inst_t gpio_dispatcher_func = NULL;
+static gpio_pin_ocre gpio_pins[CONFIG_OCRE_GPIO_MAX_PINS];
+static const struct device *gpio_ports[CONFIG_OCRE_GPIO_MAX_PORTS];
+static bool port_ready[CONFIG_OCRE_GPIO_MAX_PORTS];
 static bool gpio_system_initialized = false;
-static wasm_module_inst_t current_module_inst = NULL;
-static wasm_exec_env_t shared_exec_env = NULL;
 
-// Define GPIO port devices structure - will be populated at runtime
-static const struct device *gpio_ports[CONFIG_OCRE_GPIO_MAX_PORTS] = {NULL};
+#define INIT_GPIO_PORT_NAMED(idx, label, name_str)                                                                     \
+	do {                                                                                                           \
+		if (DT_NODE_EXISTS(label)) {                                                                           \
+			gpio_ports[idx] = DEVICE_DT_GET(label);                                                        \
+			if (!device_is_ready(gpio_ports[idx])) {                                                       \
+				LOG_ERR("%s not ready", name_str);                                                     \
+			} else {                                                                                       \
+				LOG_DBG("%s initialized", name_str);                                                   \
+				port_ready[idx] = true;                                                                \
+				port_count++;                                                                          \
+			}                                                                                              \
+		}                                                                                                      \
+	} while (0)
 
-// Board-specific GPIO port device definitions
+static void gpio_callback_handler(const struct device *port, struct gpio_callback *cb, gpio_port_pins_t pins);
+
+int ocre_gpio_init(void)
+{
+	if (gpio_system_initialized) {
+		LOG_INF("GPIO system already initialized");
+		return 0;
+	}
+	if (!common_initialized && ocre_common_init() != 0) {
+		LOG_ERR("Failed to initialize common subsystem");
+		return -EINVAL;
+	}
+	int port_count = 0;
+	memset(port_ready, 0, sizeof(port_ready));
+
 #if defined(CONFIG_BOARD_B_U585I_IOT02A)
-// STM32U5 board configuration
-#define GPIO_PORT_A DT_NODELABEL(gpioa)
-#define GPIO_PORT_B DT_NODELABEL(gpiob)
-#define GPIO_PORT_C DT_NODELABEL(gpioc)
-#define GPIO_PORT_D DT_NODELABEL(gpiod)
-#define GPIO_PORT_E DT_NODELABEL(gpioe)
-#define GPIO_PORT_F DT_NODELABEL(gpiof)
-#define GPIO_PORT_G DT_NODELABEL(gpiog)
-#define GPIO_PORT_H DT_NODELABEL(gpioh)
-static const char *gpio_port_names[CONFIG_OCRE_GPIO_MAX_PORTS] = {"GPIOA", "GPIOB", "GPIOC", "GPIOD",
-                                                                  "GPIOE", "GPIOF", "GPIOG", "GPIOH"};
+	INIT_GPIO_PORT_NAMED(0, DT_NODELABEL(gpioa), "GPIOA");
+	INIT_GPIO_PORT_NAMED(1, DT_NODELABEL(gpiob), "GPIOB");
+	INIT_GPIO_PORT_NAMED(2, DT_NODELABEL(gpioc), "GPIOC");
+	INIT_GPIO_PORT_NAMED(3, DT_NODELABEL(gpiod), "GPIOD");
+	INIT_GPIO_PORT_NAMED(4, DT_NODELABEL(gpioe), "GPIOE");
+	INIT_GPIO_PORT_NAMED(5, DT_NODELABEL(gpiof), "GPIOF");
+	INIT_GPIO_PORT_NAMED(6, DT_NODELABEL(gpiog), "GPIOG");
+	INIT_GPIO_PORT_NAMED(7, DT_NODELABEL(gpioh), "GPIOH");
+
 #elif defined(CONFIG_BOARD_ESP32C3_DEVKITM)
-// ESP32C3 board configuration
-#define GPIO_PORT_0 DT_NODELABEL(gpio0)
-static const char *gpio_port_names[CONFIG_OCRE_GPIO_MAX_PORTS] = {"GPIO0"};
+	INIT_GPIO_PORT_NAMED(0, DT_NODELABEL(gpio0), "GPIO0");
+
+#elif defined(CONFIG_BOARD_MAX32690EVKIT)
+	INIT_GPIO_PORT_NAMED(0, DT_NODELABEL(gpio0), "GPIO0");
+	INIT_GPIO_PORT_NAMED(1, DT_NODELABEL(gpio1), "GPIO1");
+	INIT_GPIO_PORT_NAMED(2, DT_NODELABEL(gpio2), "GPIO2");
+	INIT_GPIO_PORT_NAMED(3, DT_NODELABEL(gpio3), "GPIO3");
+	INIT_GPIO_PORT_NAMED(4, DT_NODELABEL(gpio4), "GPIO4");
+
+#elif defined(CONFIG_BOARD_ARDUINO_PORTENTA_H7)
+	INIT_GPIO_PORT_NAMED(0, DT_NODELABEL(gpioa), "GPIOA");
+	INIT_GPIO_PORT_NAMED(1, DT_NODELABEL(gpiob), "GPIOB");
+	INIT_GPIO_PORT_NAMED(2, DT_NODELABEL(gpioc), "GPIOC");
+	INIT_GPIO_PORT_NAMED(3, DT_NODELABEL(gpiod), "GPIOD");
+	INIT_GPIO_PORT_NAMED(4, DT_NODELABEL(gpioe), "GPIOE");
+	INIT_GPIO_PORT_NAMED(5, DT_NODELABEL(gpiof), "GPIOF");
+	INIT_GPIO_PORT_NAMED(6, DT_NODELABEL(gpiog), "GPIOG");
+	INIT_GPIO_PORT_NAMED(7, DT_NODELABEL(gpioh), "GPIOH");
+	INIT_GPIO_PORT_NAMED(8, DT_NODELABEL(gpioi), "GPIOI");
+	INIT_GPIO_PORT_NAMED(9, DT_NODELABEL(gpioj), "GPIOJ");
+	INIT_GPIO_PORT_NAMED(10, DT_NODELABEL(gpiok), "GPIOK");
+
+#elif defined(CONFIG_BOARD_W5500_EVB_PICO2)
+	INIT_GPIO_PORT_NAMED(0, DT_NODELABEL(gpio0), "GPIO0");
+
+#elif defined(CONFIG_BOARD_MIMXRT1064_EVK)
+	// No gpio0 for some reason? Will be annoying for some APIs
+	INIT_GPIO_PORT_NAMED(0, DT_NODELABEL(gpio1), "GPIO1");
+	INIT_GPIO_PORT_NAMED(1, DT_NODELABEL(gpio2), "GPIO2");
+	INIT_GPIO_PORT_NAMED(2, DT_NODELABEL(gpio3), "GPIO3");
+	INIT_GPIO_PORT_NAMED(3, DT_NODELABEL(gpio4), "GPIO4");
+	INIT_GPIO_PORT_NAMED(4, DT_NODELABEL(gpio5), "GPIO5");
+	INIT_GPIO_PORT_NAMED(5, DT_NODELABEL(gpio6), "GPIO6");
+	INIT_GPIO_PORT_NAMED(6, DT_NODELABEL(gpio7), "GPIO7");
+	INIT_GPIO_PORT_NAMED(7, DT_NODELABEL(gpio8), "GPIO8");
+	INIT_GPIO_PORT_NAMED(8, DT_NODELABEL(gpio9), "GPIO9");
+
 #else
-// Generic fallback configuration
+	// Generic fallback
 #if DT_NODE_EXISTS(DT_NODELABEL(gpio0))
-#define GPIO_PORT_0 DT_NODELABEL(gpio0)
-#endif
-#if DT_NODE_EXISTS(DT_NODELABEL(gpioa))
-#define GPIO_PORT_A DT_NODELABEL(gpioa)
-#endif
-#if DT_NODE_EXISTS(DT_NODELABEL(gpio))
-#define GPIO_PORT_G DT_NODELABEL(gpio)
-#endif
-static const char *gpio_port_names[CONFIG_OCRE_GPIO_MAX_PORTS] = {"GPIO"};
+	INIT_GPIO_PORT_NAMED(0, DT_NODELABEL(gpio0), "GPIO0");
+#elif DT_NODE_EXISTS(DT_NODELABEL(gpioa))
+	INIT_GPIO_PORT_NAMED(0, DT_NODELABEL(gpioa), "GPIOA");
 #endif
 
-void ocre_gpio_cleanup_container(wasm_module_inst_t module_inst) {
-    if (!gpio_system_initialized || !module_inst) {
-        LOG_ERR("GPIO system not properly initialized");
-        return;
-    }
-
-    if (module_inst != current_module_inst) {
-        LOG_WRN("Cleanup requested for non-active module instance");
-        return;
-    }
-
-    int cleaned_count = 0;
-    for (int i = 0; i < CONFIG_OCRE_GPIO_MAX_PINS; i++) {
-        if (gpio_pins[i].in_use) {
-            if (gpio_pins[i].direction == OCRE_GPIO_DIR_INPUT && gpio_pins[i].user_callback) {
-                gpio_pin_interrupt_configure(gpio_pins[i].port, gpio_pins[i].pin_number, GPIO_INT_DISABLE);
-                gpio_remove_callback(gpio_pins[i].port, &gpio_pins[i].gpio_cb_data);
-            }
-            gpio_pins[i].in_use = false;
-            gpio_pins[i].id = 0;
-            cleaned_count++;
-        }
-    }
-
-    LOG_INF("Cleaned up %d GPIO pins for container", cleaned_count);
+#endif
+	if (port_count == 0) {
+		LOG_ERR("No GPIO ports were initialized");
+		return -ENODEV;
+	}
+	ocre_register_cleanup_handler(OCRE_RESOURCE_TYPE_GPIO, ocre_gpio_cleanup_container);
+	gpio_system_initialized = true;
+	LOG_INF("GPIO system initialized, %d ports available", port_count);
+	return 0;
 }
 
-static void gpio_thread_fn(void *arg1, void *arg2, void *arg3) {
-    uint32_t msg_data[2]; // [0] = pin_id, [1] = state
-
-    while (1) {
-        if (k_msgq_get(&gpio_msgq, &msg_data, K_FOREVER) == 0) {
-            if (!gpio_dispatcher_func || !current_module_inst || !shared_exec_env) {
-                LOG_ERR("GPIO system not properly initialized");
-                continue;
-            }
-
-            uint32_t pin_id = msg_data[0];
-            uint32_t state = msg_data[1];
-
-            LOG_DBG("Processing GPIO pin event: %d, state: %d", pin_id, state);
-            uint32_t args[2] = {pin_id, state};
-
-            bool call_success = wasm_runtime_call_wasm(shared_exec_env, gpio_dispatcher_func, 2, args);
-
-            if (!call_success) {
-                const char *error = wasm_runtime_get_exception(current_module_inst);
-                LOG_ERR("Failed to call WASM function: %s", error ? error : "Unknown error");
-            } else {
-                LOG_INF("Successfully called WASM function for GPIO pin %d", pin_id);
-            }
-        }
-    }
+int ocre_gpio_configure(const ocre_gpio_config_t *config)
+{
+	if (!gpio_system_initialized || !config || config->pin >= CONFIG_OCRE_GPIO_PINS_PER_PORT ||
+	    config->port_idx >= CONFIG_OCRE_GPIO_MAX_PORTS || !port_ready[config->port_idx]) {
+		LOG_ERR("Invalid GPIO config: port=%d, pin=%d, port_ready=%d", config ? config->port_idx : -1,
+			config ? config->pin : -1, config ? port_ready[config->port_idx] : false);
+		return -EINVAL;
+	}
+	int port_idx = config->port_idx;
+	gpio_pin_t pin = config->pin;
+	gpio_flags_t flags = (config->direction == OCRE_GPIO_DIR_INPUT) ? GPIO_INPUT : GPIO_OUTPUT;
+	if (config->direction == OCRE_GPIO_DIR_INPUT) {
+		flags |= GPIO_PULL_UP;
+	}
+	int ret = gpio_pin_configure(gpio_ports[port_idx], pin, flags);
+	if (ret != 0) {
+		LOG_ERR("Failed to configure GPIO pin %d on port %d: %d", pin, port_idx, ret);
+		return ret;
+	}
+	wasm_module_inst_t module_inst = ocre_get_current_module();
+	if (!module_inst) {
+		LOG_ERR("No current module instance for GPIO configuration");
+		return -EINVAL;
+	}
+	int global_pin = port_idx * CONFIG_OCRE_GPIO_PINS_PER_PORT + pin;
+	if (global_pin >= CONFIG_OCRE_GPIO_MAX_PINS) {
+		LOG_ERR("Global pin %d exceeds max %d", global_pin, CONFIG_OCRE_GPIO_MAX_PINS);
+		return -EINVAL;
+	}
+	gpio_pins[global_pin] = (gpio_pin_ocre){.in_use = 1,
+						.direction = (config->direction == OCRE_GPIO_DIR_OUTPUT),
+						.pin_number = pin,
+						.port_idx = port_idx,
+						.cb = NULL,
+						.owner = module_inst};
+	ocre_increment_resource_count(module_inst, OCRE_RESOURCE_TYPE_GPIO);
+	LOG_INF("Configured GPIO pin %d on port %d (global %d) for module %p", pin, port_idx, global_pin,
+		(void *)module_inst);
+	return 0;
 }
 
-static void gpio_callback_handler(const struct device *port, struct gpio_callback *cb, gpio_port_pins_t pins) {
-    for (int i = 0; i < CONFIG_OCRE_GPIO_MAX_PINS; i++) {
-        if (gpio_pins[i].in_use && &gpio_pins[i].gpio_cb_data == cb && gpio_pins[i].port == port) {
-            if (pins & BIT(gpio_pins[i].pin_number)) {
-                int state = gpio_pin_get(port, gpio_pins[i].pin_number);
-                if (state >= 0) {
-                    uint32_t msg_data[2] = {gpio_pins[i].id, (uint32_t)state};
-                    if (k_msgq_put(&gpio_msgq, &msg_data, K_NO_WAIT) != 0) {
-                        LOG_ERR("Failed to queue GPIO callback for ID: %d", gpio_pins[i].id);
-                    }
-                }
-            }
-        }
-    }
+int ocre_gpio_pin_set(int pin, ocre_gpio_pin_state_t state)
+{
+	if (pin >= CONFIG_OCRE_GPIO_MAX_PINS || !gpio_pins[pin].in_use || gpio_pins[pin].direction != 1 ||
+	    !port_ready[gpio_pins[pin].port_idx]) {
+		LOG_ERR("Invalid GPIO pin %d or not configured as output or port not ready", pin);
+		return -EINVAL;
+	}
+	int ret = gpio_pin_set(gpio_ports[gpio_pins[pin].port_idx], gpio_pins[pin].pin_number, state);
+	if (ret != 0) {
+		LOG_ERR("Failed to set GPIO pin %d: %d", pin, ret);
+	}
+	return ret;
 }
 
-void ocre_gpio_set_module_inst(wasm_module_inst_t module_inst) {
-    current_module_inst = module_inst;
-    if (shared_exec_env) {
-        wasm_runtime_destroy_exec_env(shared_exec_env);
-    }
-    shared_exec_env = wasm_runtime_create_exec_env(module_inst, WASM_STACK_SIZE);
+ocre_gpio_pin_state_t ocre_gpio_pin_get(int pin)
+{
+	if (pin >= CONFIG_OCRE_GPIO_MAX_PINS || !gpio_pins[pin].in_use || !port_ready[gpio_pins[pin].port_idx]) {
+		LOG_ERR("Invalid or unconfigured GPIO pin %d or port not ready", pin);
+		return -EINVAL;
+	}
+	int value = gpio_pin_get(gpio_ports[gpio_pins[pin].port_idx], gpio_pins[pin].pin_number);
+	return (value >= 0) ? (value ? OCRE_GPIO_PIN_SET : OCRE_GPIO_PIN_RESET) : value;
 }
 
-void ocre_gpio_set_dispatcher(wasm_exec_env_t exec_env) {
-    if (!current_module_inst) {
-        LOG_ERR("No active WASM module instance");
-        return;
-    }
-
-    wasm_function_inst_t func = wasm_runtime_lookup_function(current_module_inst, "gpio_callback");
-    if (!func) {
-        LOG_ERR("Failed to find 'gpio_callback' in WASM module");
-        return;
-    }
-
-    gpio_dispatcher_func = func;
-    LOG_INF("WASM GPIO dispatcher function set successfully");
+int ocre_gpio_pin_toggle(int pin)
+{
+	if (pin >= CONFIG_OCRE_GPIO_MAX_PINS || !gpio_pins[pin].in_use || gpio_pins[pin].direction != 1 ||
+	    !port_ready[gpio_pins[pin].port_idx]) {
+		LOG_ERR("Invalid GPIO pin %d or not configured as output or port not ready", pin);
+		return -EINVAL;
+	}
+	int ret = gpio_pin_toggle(gpio_ports[gpio_pins[pin].port_idx], gpio_pins[pin].pin_number);
+	if (ret != 0) {
+		LOG_ERR("Failed to toggle GPIO pin %d: %d", pin, ret);
+	}
+	return ret;
 }
 
-static gpio_pin_ocre *get_gpio_from_id(int id) {
-    if (id < 0 || id >= CONFIG_OCRE_GPIO_MAX_PINS) {
-        return NULL;
-    }
-    return &gpio_pins[id];
+int ocre_gpio_register_callback(int pin)
+{
+	if (pin >= CONFIG_OCRE_GPIO_MAX_PINS || !gpio_pins[pin].in_use || gpio_pins[pin].direction != 0 ||
+	    !port_ready[gpio_pins[pin].port_idx]) {
+		LOG_ERR("Invalid GPIO pin %d or not configured as input or port not ready", pin);
+		return -EINVAL;
+	}
+	gpio_pin_ocre *gpio = &gpio_pins[pin];
+	if (!gpio->cb) {
+		gpio->cb = k_calloc(1, sizeof(struct gpio_callback));
+		if (!gpio->cb) {
+			LOG_ERR("Failed to allocate memory for GPIO callback");
+			return -ENOMEM;
+		}
+	}
+	int ret = gpio_pin_interrupt_configure(gpio_ports[gpio->port_idx], gpio->pin_number, GPIO_INT_EDGE_BOTH);
+	if (ret) {
+		LOG_ERR("Failed to configure interrupt for GPIO pin %d: %d", pin, ret);
+		k_free(gpio->cb);
+		gpio->cb = NULL;
+		return ret;
+	}
+	gpio_init_callback(gpio->cb, gpio_callback_handler, BIT(gpio->pin_number));
+	ret = gpio_add_callback(gpio_ports[gpio->port_idx], gpio->cb);
+	if (ret) {
+		LOG_ERR("Failed to add callback for GPIO pin %d: %d", pin, ret);
+		k_free(gpio->cb);
+		gpio->cb = NULL;
+		return ret;
+	}
+	LOG_INF("Registered callback for GPIO pin %d (port %d, pin %d)", pin, gpio->port_idx, gpio->pin_number);
+	return 0;
 }
 
-int ocre_gpio_init(void) {
-    if (gpio_system_initialized) {
-        LOG_INF("GPIO already initialized");
-        return 0;
-    }
+int ocre_gpio_unregister_callback(int pin)
+{
+	if (pin >= CONFIG_OCRE_GPIO_MAX_PINS || !gpio_pins[pin].in_use || !gpio_pins[pin].cb ||
+	    !port_ready[gpio_pins[pin].port_idx]) {
+		LOG_ERR("Invalid GPIO pin %d or no callback registered or port not ready", pin);
+		return -EINVAL;
+	}
+	gpio_pin_ocre *gpio = &gpio_pins[pin];
+	int ret = gpio_pin_interrupt_configure(gpio_ports[gpio->port_idx], gpio->pin_number, GPIO_INT_DISABLE);
+	if (ret) {
+		LOG_ERR("Failed to disable interrupt for GPIO pin %d: %d", pin, ret);
+		return ret;
+	}
+	ret = gpio_remove_callback(gpio_ports[gpio->port_idx], gpio->cb);
+	if (ret) {
+		LOG_ERR("Failed to remove callback for GPIO pin %d: %d", pin, ret);
+	}
+	k_free(gpio->cb);
+	gpio->cb = NULL;
+	LOG_INF("Unregistered callback for GPIO pin %d", pin);
+	return ret;
+}
 
-    // Initialize GPIO ports array based on board
-    int port_count = 0;
+void ocre_gpio_cleanup_container(wasm_module_inst_t module_inst)
+{
+	if (!gpio_system_initialized || !module_inst) {
+		LOG_DBG("GPIO system not initialized or invalid module %p", (void *)module_inst);
+		return;
+	}
+	for (int i = 0; i < CONFIG_OCRE_GPIO_MAX_PINS; i++) {
+		if (gpio_pins[i].in_use && gpio_pins[i].owner == module_inst) {
+			if (gpio_pins[i].direction == 0) {
+				ocre_gpio_unregister_callback(i);
+			}
+			gpio_pins[i].in_use = 0;
+			gpio_pins[i].owner = NULL;
+			ocre_decrement_resource_count(module_inst, OCRE_RESOURCE_TYPE_GPIO);
+			LOG_DBG("Cleaned up GPIO pin %d", i);
+		}
+	}
+	LOG_DBG("Cleaned up GPIO resources for module %p", (void *)module_inst);
+}
 
-#if defined(CONFIG_BOARD_B_U585I_IOT02A)
-    // STM32U5 board initialization
-    if (DT_NODE_EXISTS(GPIO_PORT_A)) {
-        gpio_ports[0] = DEVICE_DT_GET(GPIO_PORT_A);
-        if (!device_is_ready(gpio_ports[0])) {
-            LOG_ERR("GPIOA not ready");
-        } else {
-            LOG_INF("GPIOA initialized");
-            port_count++;
-        }
-    }
+void ocre_gpio_set_dispatcher(wasm_exec_env_t exec_env)
+{
+	wasm_module_inst_t module_inst = wasm_runtime_get_module_inst(exec_env);
+	if (module_inst) {
+		// Dispatcher set in wasm container application
+		LOG_INF("Set dispatcher for module %p", (void *)module_inst);
+	}
+}
 
-    if (DT_NODE_EXISTS(GPIO_PORT_B)) {
-        gpio_ports[1] = DEVICE_DT_GET(GPIO_PORT_B);
-        if (!device_is_ready(gpio_ports[1])) {
-            LOG_ERR("GPIOB not ready");
-        } else {
-            LOG_INF("GPIOB initialized");
-            port_count++;
-        }
-    }
+int ocre_gpio_wasm_init(wasm_exec_env_t exec_env)
+{
+	return ocre_gpio_init();
+}
 
-    if (DT_NODE_EXISTS(GPIO_PORT_C)) {
-        gpio_ports[2] = DEVICE_DT_GET(GPIO_PORT_C);
-        if (!device_is_ready(gpio_ports[2])) {
-            LOG_ERR("GPIOC not ready");
-        } else {
-            LOG_INF("GPIOC initialized");
-            port_count++;
-        }
-    }
+int ocre_gpio_wasm_configure(wasm_exec_env_t exec_env, int port, int pin, int direction)
+{
+	wasm_module_inst_t module_inst = wasm_runtime_get_module_inst(exec_env);
+	if (!module_inst) {
+		LOG_ERR("No module instance for GPIO configuration");
+		return -EINVAL;
+	}
+	if (port >= CONFIG_OCRE_GPIO_MAX_PORTS || pin >= CONFIG_OCRE_GPIO_PINS_PER_PORT || !port_ready[port]) {
+		LOG_ERR("Invalid port=%d, pin=%d, or port not ready", port, pin);
+		return -EINVAL;
+	}
+	int global_pin = port * CONFIG_OCRE_GPIO_PINS_PER_PORT + pin;
+	LOG_INF("Configuring GPIO: port=%d, pin=%d, global_pin=%d, direction=%d", port, pin, global_pin, direction);
+	if (global_pin >= CONFIG_OCRE_GPIO_MAX_PINS) {
+		LOG_ERR("Global pin %d exceeds max %d", global_pin, CONFIG_OCRE_GPIO_MAX_PINS);
+		return -EINVAL;
+	}
+	ocre_gpio_config_t config = {.pin = pin, .port_idx = port, .direction = direction};
+	return ocre_gpio_configure(&config);
+}
 
-    if (DT_NODE_EXISTS(GPIO_PORT_D)) {
-        gpio_ports[3] = DEVICE_DT_GET(GPIO_PORT_D);
-        if (!device_is_ready(gpio_ports[3])) {
-            LOG_ERR("GPIOD not ready");
-        } else {
-            LOG_INF("GPIOD initialized");
-            port_count++;
-        }
-    }
+int ocre_gpio_wasm_set(wasm_exec_env_t exec_env, int port, int pin, int state)
+{
+	int global_pin = port * CONFIG_OCRE_GPIO_PINS_PER_PORT + pin;
+	LOG_INF("Setting GPIO: port=%d, pin=%d, global_pin=%d, state=%d", port, pin, global_pin, state);
+	if (!port_ready[port]) {
+		LOG_ERR("Port %d not ready", port);
+		return -EINVAL;
+	}
+	return ocre_gpio_pin_set(global_pin, state ? OCRE_GPIO_PIN_SET : OCRE_GPIO_PIN_RESET);
+}
 
-    if (DT_NODE_EXISTS(GPIO_PORT_E)) {
-        gpio_ports[4] = DEVICE_DT_GET(GPIO_PORT_E);
-        if (!device_is_ready(gpio_ports[4])) {
-            LOG_ERR("GPIOE not ready");
-        } else {
-            LOG_INF("GPIOE initialized");
-            port_count++;
-        }
-    }
+int ocre_gpio_wasm_get(wasm_exec_env_t exec_env, int port, int pin)
+{
+	int global_pin = port * CONFIG_OCRE_GPIO_PINS_PER_PORT + pin;
+	LOG_INF("Getting GPIO: port=%d, pin=%d, global_pin=%d", port, pin, global_pin);
+	if (!port_ready[port]) {
+		LOG_ERR("Port %d not ready", port);
+		return -EINVAL;
+	}
+	return ocre_gpio_pin_get(global_pin);
+}
 
-    if (DT_NODE_EXISTS(GPIO_PORT_F)) {
-        gpio_ports[5] = DEVICE_DT_GET(GPIO_PORT_F);
-        if (!device_is_ready(gpio_ports[5])) {
-            LOG_ERR("GPIOF not ready");
-        } else {
-            LOG_INF("GPIOF initialized");
-            port_count++;
-        }
-    }
+int ocre_gpio_wasm_toggle(wasm_exec_env_t exec_env, int port, int pin)
+{
+	int global_pin = port * CONFIG_OCRE_GPIO_PINS_PER_PORT + pin;
+	LOG_INF("Toggling GPIO: port=%d, pin=%d, global_pin=%d", port, pin, global_pin);
+	if (!port_ready[port]) {
+		LOG_ERR("Port %d not ready", port);
+		return -EINVAL;
+	}
+	return ocre_gpio_pin_toggle(global_pin);
+}
 
-    if (DT_NODE_EXISTS(GPIO_PORT_G)) {
-        gpio_ports[6] = DEVICE_DT_GET(GPIO_PORT_G);
-        if (!device_is_ready(gpio_ports[6])) {
-            LOG_ERR("GPIOG not ready");
-        } else {
-            LOG_INF("GPIOG initialized");
-            port_count++;
-        }
-    }
+int ocre_gpio_wasm_register_callback(wasm_exec_env_t exec_env, int port, int pin)
+{
+	int global_pin = port * CONFIG_OCRE_GPIO_PINS_PER_PORT + pin;
+	LOG_INF("Registering callback: port=%d, pin=%d, global_pin=%d", port, pin, global_pin);
+	if (global_pin >= CONFIG_OCRE_GPIO_MAX_PINS || !port_ready[port]) {
+		LOG_ERR("Global pin %d exceeds max %d or port %d not ready", global_pin, CONFIG_OCRE_GPIO_MAX_PINS,
+			port);
+		return -EINVAL;
+	}
+	return ocre_gpio_register_callback(global_pin);
+}
 
-    if (DT_NODE_EXISTS(GPIO_PORT_H)) {
-        gpio_ports[7] = DEVICE_DT_GET(GPIO_PORT_H);
-        if (!device_is_ready(gpio_ports[7])) {
-            LOG_ERR("GPIOH not ready");
-        } else {
-            LOG_INF("GPIOH initialized");
-            port_count++;
-        }
-    }
-#elif defined(CONFIG_BOARD_ESP32C3_DEVKITM)
-    // ESP32C3 board initialization
-    if (DT_NODE_EXISTS(GPIO_PORT_0)) {
-        gpio_ports[0] = DEVICE_DT_GET(GPIO_PORT_0);
-        if (!device_is_ready(gpio_ports[0])) {
-            LOG_ERR("GPIO0 not ready");
-        } else {
-            LOG_INF("GPIO0 initialized");
-            port_count++;
-        }
-    }
-/*                       ADD BOARDS HERE                              */
+int ocre_gpio_wasm_unregister_callback(wasm_exec_env_t exec_env, int port, int pin)
+{
+	int global_pin = port * CONFIG_OCRE_GPIO_PINS_PER_PORT + pin;
+	LOG_INF("Unregistering callback: port=%d, pin=%d, global_pin=%d", port, pin, global_pin);
+	if (!port_ready[port]) {
+		LOG_ERR("Port %d not ready", port);
+		return -EINVAL;
+	}
+	return ocre_gpio_unregister_callback(global_pin);
+}
+
+static void gpio_callback_handler(const struct device *port, struct gpio_callback *cb, gpio_port_pins_t pins)
+{
+	if (!port || !cb) {
+		LOG_ERR("Null port or callback in GPIO handler");
+		return;
+	}
+	for (int i = 0; i < CONFIG_OCRE_GPIO_MAX_PINS; i++) {
+		if (gpio_pins[i].in_use && gpio_pins[i].cb == cb && (pins & BIT(gpio_pins[i].pin_number))) {
+			int state = gpio_pin_get(port, gpio_pins[i].pin_number);
+			if (state >= 0) {
+
+				ocre_event_t event;
+				event.type = OCRE_RESOURCE_TYPE_GPIO;
+				event.data.gpio_event.pin_id = gpio_pins[i].pin_number;
+				event.data.gpio_event.port = gpio_pins[i].port_idx;
+				event.data.gpio_event.state = (uint32_t)state;
+				event.owner = gpio_pins[i].owner;
+				core_spinlock_key_t key = core_spinlock_lock(&ocre_event_queue_lock);
+				if (core_eventq_put(&ocre_event_queue, &event) != 0) {
+					LOG_ERR("Failed to queue GPIO event for pin %d", i);
+				} else {
+					LOG_INF("Queued GPIO event for pin %d (port=%d, pin=%d), state=%d", i,
+						gpio_pins[i].port_idx, gpio_pins[i].pin_number, state);
+				}
+				core_spinlock_unlock(&ocre_event_queue_lock, key);
+			}
+		}
+	}
+}
+
+//========================================================================================================================================================================================================================================================================================================
+// By Name
+//========================================================================================================================================================================================================================================================================================================
+static int find_port_index(const struct device *port)
+{
+	if (!port) {
+		LOG_ERR("Null port provided to find_port_index");
+		return -EINVAL;
+	}
+	for (int i = 0; i < CONFIG_OCRE_GPIO_MAX_PORTS; i++) {
+		if (port_ready[i] && gpio_ports[i] == port) {
+			LOG_DBG("Found port at index %d: %p", i, port);
+			return i;
+		}
+	}
+	LOG_ERR("Port %p not found in initialized ports", port);
+	return -1;
+}
+
+static int resolve_gpio_alias(const char *name, int *port_idx, gpio_pin_t *pin)
+{
+	if (!name || !port_idx || !pin) {
+		LOG_ERR("Invalid parameters: name=%p, port_idx=%p, pin=%p", name, port_idx, pin);
+		return -EINVAL;
+	}
+
+	// Check if GPIO system is initialized
+	if (!gpio_system_initialized) {
+		LOG_ERR("GPIO system not initialized when resolving alias '%s'", name);
+		return -ENODEV;
+	}
+
+	// First check if we already have this alias cached
+	for (int i = 0; i < gpio_alias_count; i++) {
+		if (strcmp(gpio_aliases[i].name, name) == 0) {
+			*port_idx = gpio_aliases[i].port_idx;
+			*pin = gpio_aliases[i].pin;
+			LOG_INF("Found cached GPIO alias '%s': port %d, pin %d", name, *port_idx, *pin);
+			return 0;
+		}
+	}
+
+	// Try to resolve the alias using devicetree
+	const struct gpio_dt_spec *spec = NULL;
+	static struct gpio_dt_spec gpio_spec;
+
+	// Check common aliases - only compile if they exist
+	if (strcmp(name, "led0") == 0) {
+#if DT_NODE_EXISTS(DT_ALIAS(led0))
+		gpio_spec = (struct gpio_dt_spec)GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
+		spec = &gpio_spec;
+		LOG_DBG("Resolved DT_ALIAS(led0) to port %p, pin %d", spec ? spec->port : NULL, spec ? spec->pin : 0);
 #else
-    // Generic fallback initialization
-    // #if defined(GPIO_PORT_0)
-    // #if DT_NODE_EXISTS(GPIO_PORT_0)
-    //     gpio_ports[0] = DEVICE_DT_GET(GPIO_PORT_0);
-    //     LOG_INF("No Board Choosen Generic fallback initialization %s\n", gpio_ports[0]);
-    //     port_count = 1;
-    // #endif
-    // #endif
-
-#if defined(GPIO_PORT_A)
-#if DT_NODE_EXISTS(GPIO_PORT_A)
-    gpio_ports[0] = DEVICE_DT_GET(GPIO_PORT_A);
-    LOG_INF("No Board Choosen Generic fallback initialization %s\n", gpio_ports[0]);
-    port_count = 1;
+		LOG_ERR("DT_ALIAS(led0) not defined in device tree");
+		return -ENODEV;
 #endif
+	} else if (strcmp(name, "led1") == 0) {
+#if DT_NODE_EXISTS(DT_ALIAS(led1))
+		gpio_spec = (struct gpio_dt_spec)GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
+		spec = &gpio_spec;
+		LOG_DBG("Resolved DT_ALIAS(led1) to port %p, pin %d", spec ? spec->port : NULL, spec ? spec->pin : 0);
+#else
+		LOG_ERR("DT_ALIAS(led1) not defined in device tree");
+		return -ENODEV;
 #endif
-
-#if defined(GPIO_PORT_G)
-#if DT_NODE_EXISTS(GPIO_PORT_G)
-    gpio_ports[0] = DEVICE_DT_GET(GPIO_PORT_G);
-    LOG_INF("No Board Choosen Generic fallback initialization %s\n", gpio_ports[0]);
-    port_count = 1;
+	} else if (strcmp(name, "led2") == 0) {
+#if DT_NODE_EXISTS(DT_ALIAS(led2))
+		gpio_spec = (struct gpio_dt_spec)GPIO_DT_SPEC_GET(DT_ALIAS(led2), gpios);
+		spec = &gpio_spec;
+		LOG_DBG("Resolved DT_ALIAS(led2) to port %p, pin %d", spec ? spec->port : NULL, spec ? spec->pin : 0);
+#else
+		LOG_ERR("DT_ALIAS(led2) not defined in device tree");
+		return -ENODEV;
 #endif
+	} else if (strcmp(name, "sw0") == 0) {
+#if DT_NODE_EXISTS(DT_ALIAS(sw0))
+		gpio_spec = (struct gpio_dt_spec)GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
+		spec = &gpio_spec;
+		LOG_DBG("Resolved DT_ALIAS(sw0) to port %p, pin %d", spec ? spec->port : NULL, spec ? spec->pin : 0);
+#else
+		LOG_ERR("DT_ALIAS(sw0) not defined in device tree");
+		return -ENODEV;
 #endif
+	} else if (strcmp(name, "sw1") == 0) {
+#if DT_NODE_EXISTS(DT_ALIAS(sw1))
+		gpio_spec = (struct gpio_dt_spec)GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios);
+		spec = &gpio_spec;
+		LOG_DBG("Resolved DT_ALIAS(sw1) to port %p, pin %d", spec ? spec->port : NULL, spec ? spec->pin : 0);
+#else
+		LOG_ERR("DT_ALIAS(sw1) not defined in device tree");
+		return -ENODEV;
 #endif
+	} else {
+		LOG_ERR("Unknown GPIO alias '%s'", name);
+		return -EINVAL;
+	}
 
-    if (port_count == 0) {
-        LOG_ERR("No GPIO ports were initialized\n");
-        return -ENODEV;
-    }
+	if (!spec || !spec->port) {
+		LOG_ERR("GPIO alias '%s' not found in device tree or invalid spec", name);
+		return -ENODEV;
+	}
 
-    // Start GPIO thread for callbacks
-    gpio_thread_id = k_thread_create(&gpio_thread, gpio_thread_stack, K_THREAD_STACK_SIZEOF(gpio_thread_stack),
-                                     gpio_thread_fn, NULL, NULL, NULL, GPIO_THREAD_PRIORITY, 0, K_NO_WAIT);
-    if (!gpio_thread_id) {
-        LOG_ERR("Failed to create GPIO thread");
-        return -ENOMEM;
-    }
+	// Verify device readiness
+	if (!device_is_ready(spec->port)) {
+		LOG_ERR("Device for GPIO alias '%s' (port %p) not ready", name, spec->port);
+		return -ENODEV;
+	}
 
-    k_thread_name_set(gpio_thread_id, "gpio_thread");
-    LOG_INF("GPIO system initialized with %d ports", port_count);
-    gpio_system_initialized = true;
-    return 0;
+	// Find the port index
+	int found_port_idx = find_port_index(spec->port);
+	if (found_port_idx < 0) {
+		LOG_ERR("Port for alias '%s' (port %p) not found in initialized ports", name, spec->port);
+		// Debug: print all available ports
+		LOG_ERR("Available ports:");
+		bool any_ports = false;
+		for (int i = 0; i < CONFIG_OCRE_GPIO_MAX_PORTS; i++) {
+			if (port_ready[i] && gpio_ports[i]) {
+				LOG_ERR("  Port %d: %p", i, gpio_ports[i]);
+				any_ports = true;
+			}
+		}
+		if (!any_ports) {
+			LOG_ERR("  No ports initialized");
+		}
+		LOG_ERR("Looking for port: %p", spec->port);
+		return -ENODEV;
+	}
+
+	*port_idx = found_port_idx;
+	*pin = spec->pin;
+
+	// Cache the resolved alias
+	if (gpio_alias_count < CONFIG_OCRE_GPIO_MAX_PINS) {
+		gpio_aliases[gpio_alias_count].name = name;
+		gpio_aliases[gpio_alias_count].port = spec->port;
+		gpio_aliases[gpio_alias_count].pin = spec->pin;
+		gpio_aliases[gpio_alias_count].port_idx = found_port_idx;
+		gpio_alias_count++;
+		LOG_INF("Cached GPIO alias '%s': port %d, pin %d", name, found_port_idx, spec->pin);
+	} else {
+		LOG_WRN("Cannot cache alias '%s': alias table full", name);
+	}
+
+	LOG_INF("Resolved GPIO alias '%s' to port %d, pin %d", name, *port_idx, *pin);
+	return 0;
 }
 
-int ocre_gpio_configure(const ocre_gpio_config_t *config) {
-    if (!gpio_system_initialized) {
-        LOG_ERR("GPIO not initialized");
-        return -ENODEV;
-    }
+int ocre_gpio_configure_by_name(const char *name, ocre_gpio_direction_t direction)
+{
+	if (!name) {
+		LOG_ERR("Invalid name parameter");
+		return -EINVAL;
+	}
 
-    if (config == NULL) {
-        LOG_ERR("NULL config pointer");
-        return -EINVAL;
-    }
+	int port_idx;
+	gpio_pin_t pin;
+	int ret = resolve_gpio_alias(name, &port_idx, &pin);
+	if (ret != 0) {
+		return ret;
+	}
 
-    if (config->pin < 0 || config->pin >= CONFIG_OCRE_GPIO_MAX_PINS) {
-        LOG_ERR("Invalid GPIO pin number: %d", config->pin);
-        return -EINVAL;
-    }
+	ocre_gpio_config_t config = {.pin = pin, .port_idx = port_idx, .direction = direction};
 
-    // Map logical pin to physical port/pin
-    int port_idx = config->pin / CONFIG_OCRE_GPIO_PINS_PER_PORT;
-    gpio_pin_t pin_number = config->pin % CONFIG_OCRE_GPIO_PINS_PER_PORT;
-
-    if (port_idx >= CONFIG_OCRE_GPIO_MAX_PORTS || gpio_ports[port_idx] == NULL) {
-        LOG_ERR("Invalid GPIO port index: %d", port_idx);
-        return -EINVAL;
-    }
-
-    // Configure Zephyr GPIO
-    gpio_flags_t flags = 0;
-
-    if (config->direction == OCRE_GPIO_DIR_INPUT) {
-        flags = GPIO_INPUT;
-    } else if (config->direction == OCRE_GPIO_DIR_OUTPUT) {
-        flags = GPIO_OUTPUT;
-    } else {
-        LOG_ERR("Invalid GPIO direction");
-        return -EINVAL;
-    }
-
-    int ret = gpio_pin_configure(gpio_ports[port_idx], pin_number, flags);
-    if (ret != 0) {
-        LOG_ERR("Failed to configure GPIO pin: %d", ret);
-        return ret;
-    }
-
-    // Update our tracking information
-    gpio_pins[config->pin].in_use = true;
-    gpio_pins[config->pin].id = config->pin;
-    gpio_pins[config->pin].port = gpio_ports[port_idx];
-    gpio_pins[config->pin].pin_number = pin_number;
-    gpio_pins[config->pin].direction = config->direction;
-    gpio_pins[config->pin].user_callback = NULL;
-
-    LOG_DBG("Configured GPIO pin %d: port=%s, pin=%d, direction=%d", config->pin, gpio_port_names[port_idx], pin_number,
-            config->direction);
-
-    return 0;
+	return ocre_gpio_configure(&config);
 }
 
-int ocre_gpio_pin_set(int pin, ocre_gpio_pin_state_t state) {
-    gpio_pin_ocre *gpio = get_gpio_from_id(pin);
+int ocre_gpio_set_by_name(const char *name, ocre_gpio_pin_state_t state)
+{
+	if (!name) {
+		LOG_ERR("Invalid name parameter");
+		return -EINVAL;
+	}
 
-    if (!gpio_system_initialized) {
-        LOG_ERR("GPIO system not initialized when trying to set pin %d", pin);
-        return -ENODEV;
-    }
+	int port_idx;
+	gpio_pin_t pin;
+	int ret = resolve_gpio_alias(name, &port_idx, &pin);
+	if (ret != 0) {
+		return ret;
+	}
 
-    if (!gpio || !gpio->in_use) {
-        LOG_ERR("Invalid or unconfigured GPIO pin: %d", pin);
-        return -EINVAL;
-    }
-
-    if (gpio->direction != OCRE_GPIO_DIR_OUTPUT) {
-        LOG_ERR("Cannot set state of input pin: %d", pin);
-        return -EINVAL;
-    }
-
-    LOG_INF("Setting GPIO pin %d (port=%p, pin=%d) to state %d", pin, gpio->port, gpio->pin_number, state);
-
-    int ret = gpio_pin_set(gpio->port, gpio->pin_number, state);
-    if (ret != 0) {
-        LOG_ERR("Failed to set GPIO pin %d: %d", pin, ret);
-        return ret;
-    }
-
-    LOG_INF("Successfully set GPIO pin %d to state %d", pin, state);
-    return 0;
+	int global_pin = port_idx * CONFIG_OCRE_GPIO_PINS_PER_PORT + pin;
+	return ocre_gpio_pin_set(global_pin, state);
 }
 
-ocre_gpio_pin_state_t ocre_gpio_pin_get(int pin) {
-    gpio_pin_ocre *gpio = get_gpio_from_id(pin);
+int ocre_gpio_toggle_by_name(const char *name)
+{
+	if (!name) {
+		LOG_ERR("Invalid name parameter");
+		return -EINVAL;
+	}
 
-    if (!gpio_system_initialized) {
-        return -ENODEV;
-    }
+	int port_idx;
+	gpio_pin_t pin;
+	int ret = resolve_gpio_alias(name, &port_idx, &pin);
+	if (ret != 0) {
+		return ret;
+	}
 
-    if (!gpio || !gpio->in_use) {
-        LOG_ERR("Invalid or unconfigured GPIO pin: %d", pin);
-        return -EINVAL;
-    }
-
-    int value = gpio_pin_get(gpio->port, gpio->pin_number);
-    if (value < 0) {
-        LOG_ERR("Failed to get GPIO pin %d state: %d", pin, value);
-        return value;
-    }
-
-    return value ? OCRE_GPIO_PIN_SET : OCRE_GPIO_PIN_RESET;
+	int global_pin = port_idx * CONFIG_OCRE_GPIO_PINS_PER_PORT + pin;
+	return ocre_gpio_pin_toggle(global_pin);
 }
 
-int ocre_gpio_pin_toggle(int pin) {
-    gpio_pin_ocre *gpio = get_gpio_from_id(pin);
+ocre_gpio_pin_state_t ocre_gpio_get_by_name(const char *name)
+{
+	if (!name) {
+		LOG_ERR("Invalid name parameter");
+		return -EINVAL;
+	}
 
-    if (!gpio_system_initialized) {
-        return -ENODEV;
-    }
+	int port_idx;
+	gpio_pin_t pin;
+	int ret = resolve_gpio_alias(name, &port_idx, &pin);
+	if (ret != 0) {
+		return ret;
+	}
 
-    if (!gpio || !gpio->in_use) {
-        LOG_ERR("Invalid or unconfigured GPIO pin: %d", pin);
-        return -EINVAL;
-    }
-
-    if (gpio->direction != OCRE_GPIO_DIR_OUTPUT) {
-        LOG_ERR("Cannot toggle state of input pin: %d", pin);
-        return -EINVAL;
-    }
-
-    int ret = gpio_pin_toggle(gpio->port, gpio->pin_number);
-    if (ret != 0) {
-        LOG_ERR("Failed to toggle GPIO pin %d: %d", pin, ret);
-        return ret;
-    }
-
-    return 0;
+	int global_pin = port_idx * CONFIG_OCRE_GPIO_PINS_PER_PORT + pin;
+	return ocre_gpio_pin_get(global_pin);
 }
 
-int ocre_gpio_register_callback(int pin, ocre_gpio_callback_t callback) {
-    gpio_pin_ocre *gpio = get_gpio_from_id(pin);
+int ocre_gpio_wasm_configure_by_name(wasm_exec_env_t exec_env, const char *name, int direction)
+{
+	if (!name) {
+		LOG_ERR("Invalid name parameter");
+		return -EINVAL;
+	}
 
-    if (!gpio_system_initialized) {
-        return -ENODEV;
-    }
+	wasm_module_inst_t module_inst = wasm_runtime_get_module_inst(exec_env);
+	if (!module_inst) {
+		LOG_ERR("No module instance for GPIO configuration");
+		return -EINVAL;
+	}
 
-    if (!gpio || !gpio->in_use) {
-        LOG_ERR("Invalid or unconfigured GPIO pin: %d", pin);
-        return -EINVAL;
-    }
-
-    if (gpio->direction != OCRE_GPIO_DIR_INPUT) {
-        LOG_ERR("Cannot register callback on output pin: %d", pin);
-        return -EINVAL;
-    }
-
-    // Configure the interrupt
-    int ret = gpio_pin_interrupt_configure(gpio->port, gpio->pin_number, GPIO_INT_EDGE_BOTH);
-    if (ret != 0) {
-        LOG_ERR("Failed to configure GPIO interrupt: %d", ret);
-        return ret;
-    }
-
-    // Initialize the callback structure
-    gpio_init_callback(&gpio->gpio_cb_data, gpio_callback_handler, BIT(gpio->pin_number));
-    ret = gpio_add_callback(gpio->port, &gpio->gpio_cb_data);
-    if (ret != 0) {
-        LOG_ERR("Failed to add GPIO callback: %d", ret);
-        return ret;
-    }
-
-    // Store the user callback
-    gpio->user_callback = callback;
-    LOG_DBG("Registered callback for GPIO pin %d", pin);
-
-    return 0;
+	LOG_INF("Configuring GPIO by name: %s, direction=%d", name, direction);
+	return ocre_gpio_configure_by_name(name, direction);
 }
 
-int ocre_gpio_unregister_callback(int pin) {
-    gpio_pin_ocre *gpio = get_gpio_from_id(pin);
+int ocre_gpio_wasm_set_by_name(wasm_exec_env_t exec_env, const char *name, int state)
+{
+	if (!name) {
+		LOG_ERR("Invalid name parameter");
+		return -EINVAL;
+	}
 
-    if (!gpio_system_initialized) {
-        return -ENODEV;
-    }
-
-    if (!gpio || !gpio->in_use) {
-        LOG_ERR("Invalid or unconfigured GPIO pin: %d", pin);
-        return -EINVAL;
-    }
-
-    if (!gpio->user_callback) {
-        LOG_WRN("No callback registered for pin %d", pin);
-        return 0;
-    }
-
-    // Disable interrupt and remove callback
-    int ret = gpio_pin_interrupt_configure(gpio->port, gpio->pin_number, GPIO_INT_DISABLE);
-    if (ret != 0) {
-        LOG_ERR("Failed to disable GPIO interrupt: %d", ret);
-        return ret;
-    }
-
-    ret = gpio_remove_callback(gpio->port, &gpio->gpio_cb_data);
-    if (ret != 0) {
-        LOG_ERR("Failed to remove GPIO callback: %d", ret);
-        return ret;
-    }
-
-    gpio->user_callback = NULL;
-    LOG_DBG("Unregistered callback for GPIO pin %d", pin);
-
-    return 0;
+	LOG_INF("Setting GPIO by name: %s, state=%d", name, state);
+	return ocre_gpio_set_by_name(name, state ? OCRE_GPIO_PIN_SET : OCRE_GPIO_PIN_RESET);
 }
 
-int get_pin_id(int port, int pin) {
-    // Ensure the pin is valid within the specified port
-    if (pin < 0 || pin >= CONFIG_OCRE_GPIO_PINS_PER_PORT) {
-        printf("Invalid pin number\n");
-        return -1; // Return -1 for invalid pin number
-    }
+int ocre_gpio_wasm_get_by_name(wasm_exec_env_t exec_env, const char *name)
+{
+	if (!name) {
+		LOG_ERR("Invalid name parameter");
+		return -EINVAL;
+	}
 
-    // Calculate the pin ID
-    int pin_id = port * CONFIG_OCRE_GPIO_PINS_PER_PORT + pin;
-    return pin_id;
+	LOG_INF("Getting GPIO by name: %s", name);
+	return ocre_gpio_get_by_name(name);
 }
 
-// WASM-exposed functions for GPIO control
-int ocre_gpio_wasm_init(wasm_exec_env_t exec_env) {
-    return ocre_gpio_init();
+int ocre_gpio_wasm_toggle_by_name(wasm_exec_env_t exec_env, const char *name)
+{
+	if (!name) {
+		LOG_ERR("Invalid name parameter");
+		return -EINVAL;
+	}
+
+	LOG_INF("Toggling GPIO by name: %s", name);
+	return ocre_gpio_toggle_by_name(name);
 }
 
-int ocre_gpio_wasm_configure(wasm_exec_env_t exec_env, int port, int P_pin, int direction) {
-    if (!gpio_system_initialized) {
-        LOG_ERR("GPIO system not initialized");
-        return -ENODEV;
-    }
-    int pin = get_pin_id(port, P_pin);
-    ocre_gpio_config_t config;
-    config.pin = pin;
-    config.direction = direction;
+int ocre_gpio_wasm_register_callback_by_name(wasm_exec_env_t exec_env, const char *name)
+{
+	if (!name) {
+		LOG_ERR("Invalid name parameter");
+		return -EINVAL;
+	}
 
-    return ocre_gpio_configure(&config);
+	int port_idx;
+	gpio_pin_t pin;
+	int ret = resolve_gpio_alias(name, &port_idx, &pin);
+	if (ret != 0) {
+		return ret;
+	}
+
+	int global_pin = port_idx * CONFIG_OCRE_GPIO_PINS_PER_PORT + pin;
+	LOG_INF("Registering callback by name: %s, global_pin=%d", name, global_pin);
+
+	if (global_pin >= CONFIG_OCRE_GPIO_MAX_PINS) {
+		LOG_ERR("Global pin %d exceeds max %d", global_pin, CONFIG_OCRE_GPIO_MAX_PINS);
+		return -EINVAL;
+	}
+
+	return ocre_gpio_register_callback(global_pin);
 }
 
-int ocre_gpio_wasm_set(wasm_exec_env_t exec_env, int port, int P_pin, int state) {
-    int pin = get_pin_id(port, P_pin);
-    return ocre_gpio_pin_set(pin, state ? OCRE_GPIO_PIN_SET : OCRE_GPIO_PIN_RESET);
-}
+int ocre_gpio_wasm_unregister_callback_by_name(wasm_exec_env_t exec_env, const char *name)
+{
+	if (!name) {
+		LOG_ERR("Invalid name parameter");
+		return -EINVAL;
+	}
 
-int ocre_gpio_wasm_get(wasm_exec_env_t exec_env, int port, int P_pin) {
-    int pin = get_pin_id(port, P_pin);
-    return ocre_gpio_pin_get(pin);
-}
+	int port_idx;
+	gpio_pin_t pin;
+	int ret = resolve_gpio_alias(name, &port_idx, &pin);
+	if (ret != 0) {
+		return ret;
+	}
 
-int ocre_gpio_wasm_toggle(wasm_exec_env_t exec_env, int port, int P_pin) {
-    int pin = get_pin_id(port, P_pin);
-    return ocre_gpio_pin_toggle(pin);
-}
+	int global_pin = port_idx * CONFIG_OCRE_GPIO_PINS_PER_PORT + pin;
+	LOG_INF("Unregistering callback by name: %s, global_pin=%d", name, global_pin);
 
-int ocre_gpio_wasm_register_callback(wasm_exec_env_t exec_env, int port, int P_pin) {
-    int pin = get_pin_id(port, P_pin);
-    ocre_gpio_set_dispatcher(exec_env);
-
-    // For WASM, we don't need an actual callback function pointer
-    // as we'll use the dispatcher to call the appropriate WASM function
-    return ocre_gpio_register_callback(pin, NULL);
-}
-
-int ocre_gpio_wasm_unregister_callback(wasm_exec_env_t exec_env, int port, int P_pin) {
-    int pin = get_pin_id(port, P_pin);
-    return ocre_gpio_unregister_callback(pin);
+	return ocre_gpio_unregister_callback(global_pin);
 }

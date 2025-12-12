@@ -1,14 +1,20 @@
 manifest:
   projects:
     - name: zephyr
-      revision: v3.7-branch
-      url: https://github.com/zephyrproject-rtos/zephyr
+      revision: staging
+      url: https://github.com/project-ocre/zephyr
       west-commands: scripts/west-commands.yml
-      import: true
-    - name: wasm-micro-runtime
-      revision: dev/zephyr_file_socket
-      url: https://github.com/bytecodealliance/wasm-micro-runtime
-      path: wasm-micro-runtime
-      
+      import:
+        name-allowlist:
+          - littlefs
+          - picolibc
+          - mcuboot
+          - zcbor
+          - hal_stm32
+          - hal_st
+          - mbedtls
+          - cmsis_6
+          - hal_nordic
+
   self:
-    path: application   
+    path: application
